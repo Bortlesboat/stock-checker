@@ -11,7 +11,6 @@ import sys
 import winsound
 import threading
 import logging
-import concurrent.futures
 
 try:
     from plyer import notification
@@ -55,81 +54,83 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# JavaScript to inject into page for fast DOM checking
+# JavaScript to inject into page for DOM stock checking
 JS_CHECK_STOCK = """
 () => {
-    // Check for add-to-cart type buttons
-    const selectors = [
+    // Check for add-to-cart type buttons (Target-specific data-test attributes)
+    const inStockSelectors = [
         'button[data-test="addToCartButton"]',
         'button[data-test="shipItButton"]',
         'button[data-test="pickItUpButton"]',
+        'button[data-test="orderPickupButton"]',
+        'button[data-test="deliverItButton"]',
+        '[data-test="addToCartButton"]',
+        '[data-test="shipItButton"]',
+        '[data-test="pickItUpButton"]',
     ];
 
-    for (const sel of selectors) {
+    for (const sel of inStockSelectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+            // Check if element is visible (not hidden)
+            const style = window.getComputedStyle(el);
+            if (style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null) {
+                return { inStock: true, reason: `Button: ${el.innerText.trim().substring(0, 30)}` };
+            }
+        }
+    }
+
+    // Check for any visible button/link with purchase-related text
+    const allClickables = document.querySelectorAll('button, a[role="button"], [role="button"]');
+    for (const el of allClickables) {
+        const text = el.innerText?.toLowerCase()?.trim() || '';
+        if ((text.includes('add to cart') || text.includes('ship it') ||
+             text.includes('pick it up') || text.includes('deliver it') ||
+             text === 'buy now') && el.offsetParent !== null) {
+            const style = window.getComputedStyle(el);
+            if (style.display !== 'none' && style.visibility !== 'hidden') {
+                return { inStock: true, reason: `Button text: "${el.innerText.trim().substring(0, 30)}"` };
+            }
+        }
+    }
+
+    // Check for out-of-stock indicators (Target-specific)
+    const outOfStockSelectors = [
+        '[data-test="outOfStockButton"]',
+        '[data-test="notifyMeButton"]',
+        '[data-test="soldOutButton"]',
+    ];
+
+    for (const sel of outOfStockSelectors) {
         const el = document.querySelector(sel);
         if (el && el.offsetParent !== null) {
-            return { inStock: true, reason: `Button found: ${el.innerText.trim()}` };
+            return { inStock: false, reason: `OOS button: ${el.innerText.trim().substring(0, 30)}` };
         }
     }
 
-    // Check for any visible button with "add to cart" text
-    const buttons = document.querySelectorAll('button');
-    for (const btn of buttons) {
-        if (btn.innerText.toLowerCase().includes('add to cart') && btn.offsetParent !== null) {
-            return { inStock: true, reason: 'Add to cart button visible' };
-        }
-    }
-
-    // Check body text for out-of-stock indicators
+    // Check body text for out-of-stock phrases
     const bodyText = document.body?.innerText?.toLowerCase() || '';
-    const outPhrases = ['out of stock', 'sold out', "notify me when it's back", 'currently unavailable'];
+    const outPhrases = [
+        'out of stock', 'sold out', "notify me when it's back",
+        'currently unavailable', 'temporarily out of stock',
+        'this item is not available', 'not sold at this store'
+    ];
     for (const phrase of outPhrases) {
         if (bodyText.includes(phrase)) {
             return { inStock: false, reason: phrase };
         }
     }
 
-    return { inStock: false, reason: 'No add-to-cart button' };
-}
-"""
-
-# JavaScript for ultra-fast fetch-based check (no page render needed)
-JS_FETCH_CHECK = """
-async (url) => {
-    try {
-        const resp = await fetch(url, { credentials: 'same-origin' });
-        const html = await resp.text();
-        const lower = html.toLowerCase();
-
-        if (html.includes('data-test="addToCartButton"') ||
-            html.includes('data-test="shipItButton"') ||
-            html.includes('data-test="pickItUpButton"')) {
-            return { inStock: true, reason: 'Button in HTML (fetch)', conclusive: true };
-        }
-
-        if (lower.includes('out of stock') || lower.includes('sold out') ||
-            lower.includes('currently unavailable')) {
-            return { inStock: false, reason: 'Out of stock (fetch)', conclusive: true };
-        }
-
-        // Check for availability_status in embedded JSON
-        const stockMatch = html.match(/"availability_status":"([^"]+)"/);
-        if (stockMatch) {
-            const status = stockMatch[1];
-            if (status === 'IN_STOCK' || status === 'AVAILABLE' || status === 'LIMITED_STOCK') {
-                return { inStock: true, reason: `Status: ${status} (fetch)`, conclusive: true };
-            }
-            if (status === 'OUT_OF_STOCK' || status === 'UNAVAILABLE') {
-                return { inStock: false, reason: `Status: ${status} (fetch)`, conclusive: true };
-            }
-        }
-
-        return { inStock: false, reason: 'Inconclusive (fetch)', conclusive: false };
-    } catch(e) {
-        return { inStock: false, reason: `Fetch error: ${e.message}`, conclusive: false };
+    // Check if page has product content at all (might be error/captcha page)
+    const hasProductInfo = document.querySelector('[data-test="product-title"], h1[data-test], [data-test="product-price"]');
+    if (!hasProductInfo) {
+        return { inStock: false, reason: 'No product content (possible block/captcha)' };
     }
+
+    return { inStock: false, reason: 'No purchase button found' };
 }
 """
+
 
 
 # --- Config ---
@@ -276,11 +277,11 @@ def show_menu(config: dict):
     clear_screen()
     print()
     print("  ╔═══════════════════════════════════════════════════════╗")
-    print("  ║          TARGET STOCK CHECKER  v3.0 (SPEED)           ║")
+    print("  ║          TARGET STOCK CHECKER  v3.1 (FIXED)             ║")
     print("  ╠═══════════════════════════════════════════════════════╣")
     print("  ║                                                       ║")
     print(f"  ║   Check every: {config['interval_seconds']} second(s){' ' * (34 - len(str(config['interval_seconds'])))}║")
-    print("  ║   Method: Parallel browser + JS injection             ║")
+    print("  ║   Method: Browser reload + DOM scan (reliable)        ║")
     print("  ║                                                       ║")
     print("  ║   Products being monitored:                           ║")
 
@@ -465,48 +466,26 @@ def alert_user(url: str, reason: str):
 
 # --- Monitoring Engine ---
 
-def check_page_fast(page, url: str) -> tuple[bool, str]:
+def check_page(page, url: str) -> tuple[bool, str]:
     """
-    Ultra-fast check using JS fetch from within the browser context.
-    No page reload needed - just a background fetch + HTML scan.
+    Reload the page and check the rendered DOM for stock buttons.
+    This is the only reliable method for Target's React-rendered pages.
     """
     try:
-        result = page.evaluate(JS_FETCH_CHECK, url)
-        if result.get("conclusive"):
-            return result["inStock"], result["reason"]
-    except Exception as e:
-        pass
-
-    # Fallback: check current DOM state
-    try:
-        result = page.evaluate(JS_CHECK_STOCK)
-        return result["inStock"], result["reason"]
+        page.reload(wait_until="domcontentloaded", timeout=12000)
     except Exception:
-        return False, "Check failed"
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=12000)
+        except Exception as e:
+            return False, f"Load error: {e}"
 
-
-def check_page_full(page, url: str) -> tuple[bool, str]:
-    """
-    Full page reload check. Used on first load and periodically.
-    """
+    # Wait for React to render product content (price or title = page is loaded)
     try:
-        page.reload(wait_until="domcontentloaded", timeout=10000)
-    except Exception as e:
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=10000)
-        except Exception as e2:
-            return False, f"Load error: {e2}"
+        page.wait_for_selector('[data-test="product-price"], [data-test="product-title"], h1[data-test]', timeout=4000)
+    except Exception:
+        pass  # Timeout - page might be blocked or slow, we'll still check DOM
 
-    # Quick wait for any cart button (max 2s)
-    for selector in TARGET_IN_STOCK_SELECTORS:
-        try:
-            el = page.wait_for_selector(selector, timeout=800, state="visible")
-            if el:
-                return True, f"Button: {el.inner_text().strip()}"
-        except Exception:
-            continue
-
-    # Check DOM
+    # Check rendered DOM with JavaScript
     try:
         result = page.evaluate(JS_CHECK_STOCK)
         return result["inStock"], result["reason"]
@@ -528,7 +507,7 @@ def start_monitoring(config: dict):
     print("  ╔═══════════════════════════════════════════════════════╗")
     print("  ║       MONITORING - Press Ctrl+C to stop               ║")
     print("  ╠═══════════════════════════════════════════════════════╣")
-    print(f"  ║   {len(urls)} product(s) | every {interval}s | parallel + JS inject{' ' * (9 - len(str(len(urls))) - len(str(interval)))}║")
+    print(f"  ║   {len(urls)} product(s) | every {interval}s | full DOM check{' ' * (15 - len(str(len(urls))) - len(str(interval)))}║")
     for i, url in enumerate(urls):
         name = get_short_name(url)
         print(f"  ║   {i+1}. {name:<49} ║")
@@ -568,60 +547,43 @@ def start_monitoring(config: dict):
         pages[url] = page
 
     print("  Pages loaded. Monitoring started!\n")
-    check_count = 0
-    full_reload_every = 10  # Do a full reload every N checks to refresh session
 
     try:
         while True:
-            check_count += 1
             monitor.set_checking("Checking...")
             start_time = time.time()
 
-            # Check all pages
+            # Check all pages (each gets a fresh reload)
             for url in list(urls):
                 page = pages.get(url)
                 if not page:
                     continue
 
                 name = get_short_name(url)
-
-                # Every N checks, do a full reload to keep session fresh
-                if check_count % full_reload_every == 0:
-                    in_stock, reason = check_page_full(page, url)
-                    method = "RELOAD"
-                else:
-                    in_stock, reason = check_page_fast(page, url)
-                    method = "FAST"
-
+                in_stock, reason = check_page(page, url)
                 elapsed_ms = int((time.time() - start_time) * 1000)
 
                 if in_stock:
-                    # Double-confirm with a full reload
-                    confirm_stock, confirm_reason = check_page_full(page, url)
-                    if confirm_stock:
-                        monitor.stop()
-                        monitor.clear_line()
-                        alert_user(url, f"{reason} (confirmed: {confirm_reason})")
-                        log(f"*** IN STOCK: {name} - {reason} ***")
-                        print("  Opening in your browser...")
-                        import webbrowser
-                        webbrowser.open(url)
-                        urls.remove(url)
-                        page.close()
-                        del pages[url]
-                        if not urls:
-                            print("\n  All items found! Done.")
-                            log("--- All items found. ---")
-                            browser.close()
-                            pw.stop()
-                            input("\n  Press Enter to go back...")
-                            return
-                        monitor = StatusMonitor()
-                    else:
-                        log(f"[{name}] False positive: {reason} -> {confirm_reason}")
-                        monitor.set_result(f"[{name[:15]}] {confirm_reason}", elapsed_ms)
+                    monitor.stop()
+                    monitor.clear_line()
+                    alert_user(url, reason)
+                    log(f"*** IN STOCK: {name} - {reason} ***")
+                    print("  Opening in your browser...")
+                    import webbrowser
+                    webbrowser.open(url)
+                    urls.remove(url)
+                    page.close()
+                    del pages[url]
+                    if not urls:
+                        print("\n  All items found! Done.")
+                        log("--- All items found. ---")
+                        browser.close()
+                        pw.stop()
+                        input("\n  Press Enter to go back...")
+                        return
+                    monitor = StatusMonitor()
                 else:
-                    log(f"[{name}] [{method}] {reason}")
+                    log(f"[{name}] {reason}")
                     monitor.set_result(f"[{name[:15]}] {reason}", elapsed_ms)
 
             elapsed_ms = int((time.time() - start_time) * 1000)
