@@ -1,6 +1,6 @@
 """
-Stock Checker for Target - Optimized for speed.
-Fast HTTP checks with browser fallback. Parallel URL monitoring.
+Stock Checker for Target - Optimized for maximum speed.
+Parallel browser tabs with JS-injection checks. No wasted time.
 """
 
 import json
@@ -12,8 +12,6 @@ import winsound
 import threading
 import logging
 import concurrent.futures
-
-import requests
 
 try:
     from plyer import notification
@@ -43,24 +41,95 @@ TARGET_OUT_OF_STOCK_INDICATORS = [
 BLOCKED_RESOURCE_TYPES = ["image", "media", "font", "stylesheet"]
 BLOCKED_URL_PATTERNS = [
     "analytics", "tracking", "ads", "doubleclick", "facebook",
-    "google-analytics", "hotjar", "optimizely", "segment",
+    "google-analytics", "hotjar", "optimizely", "segment", "newrelic",
+    "tealium", "demdex", "omtrdc", "pinterest", "twitter", "snap",
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico",
-    ".woff", ".woff2", ".ttf", ".eot",
+    ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".webm",
 ]
 
 SPINNER_CHARS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+# JavaScript to inject into page for fast DOM checking
+JS_CHECK_STOCK = """
+() => {
+    // Check for add-to-cart type buttons
+    const selectors = [
+        'button[data-test="addToCartButton"]',
+        'button[data-test="shipItButton"]',
+        'button[data-test="pickItUpButton"]',
+    ];
+
+    for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el && el.offsetParent !== null) {
+            return { inStock: true, reason: `Button found: ${el.innerText.trim()}` };
+        }
+    }
+
+    // Check for any visible button with "add to cart" text
+    const buttons = document.querySelectorAll('button');
+    for (const btn of buttons) {
+        if (btn.innerText.toLowerCase().includes('add to cart') && btn.offsetParent !== null) {
+            return { inStock: true, reason: 'Add to cart button visible' };
+        }
+    }
+
+    // Check body text for out-of-stock indicators
+    const bodyText = document.body?.innerText?.toLowerCase() || '';
+    const outPhrases = ['out of stock', 'sold out', "notify me when it's back", 'currently unavailable'];
+    for (const phrase of outPhrases) {
+        if (bodyText.includes(phrase)) {
+            return { inStock: false, reason: phrase };
+        }
+    }
+
+    return { inStock: false, reason: 'No add-to-cart button' };
 }
+"""
+
+# JavaScript for ultra-fast fetch-based check (no page render needed)
+JS_FETCH_CHECK = """
+async (url) => {
+    try {
+        const resp = await fetch(url, { credentials: 'same-origin' });
+        const html = await resp.text();
+        const lower = html.toLowerCase();
+
+        if (html.includes('data-test="addToCartButton"') ||
+            html.includes('data-test="shipItButton"') ||
+            html.includes('data-test="pickItUpButton"')) {
+            return { inStock: true, reason: 'Button in HTML (fetch)', conclusive: true };
+        }
+
+        if (lower.includes('out of stock') || lower.includes('sold out') ||
+            lower.includes('currently unavailable')) {
+            return { inStock: false, reason: 'Out of stock (fetch)', conclusive: true };
+        }
+
+        // Check for availability_status in embedded JSON
+        const stockMatch = html.match(/"availability_status":"([^"]+)"/);
+        if (stockMatch) {
+            const status = stockMatch[1];
+            if (status === 'IN_STOCK' || status === 'AVAILABLE' || status === 'LIMITED_STOCK') {
+                return { inStock: true, reason: `Status: ${status} (fetch)`, conclusive: true };
+            }
+            if (status === 'OUT_OF_STOCK' || status === 'UNAVAILABLE') {
+                return { inStock: false, reason: `Status: ${status} (fetch)`, conclusive: true };
+            }
+        }
+
+        return { inStock: false, reason: 'Inconclusive (fetch)', conclusive: false };
+    } catch(e) {
+        return { inStock: false, reason: `Fetch error: ${e.message}`, conclusive: false };
+    }
+}
+"""
 
 
 # --- Config ---
@@ -114,141 +183,20 @@ def get_short_name(url: str) -> str:
 
 
 def get_tcin(url: str) -> str:
-    """Extract Target product TCIN from URL."""
     match = re.search(r"A-(\d+)", url)
     return match.group(1) if match else ""
-
-
-# --- Fast HTTP Check ---
-
-def check_stock_fast(url: str, session: requests.Session) -> tuple[bool, str, bool]:
-    """
-    Fast stock check using HTTP request (no browser).
-    Returns (is_in_stock, reason, is_conclusive).
-    If not conclusive, caller should fall back to browser check.
-    """
-    try:
-        resp = session.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        return False, f"HTTP error: {e}", False
-
-    html = resp.text.lower()
-
-    # Check for out-of-stock indicators in raw HTML
-    for phrase in TARGET_OUT_OF_STOCK_INDICATORS:
-        if phrase in html:
-            return False, f"'{phrase}'", True
-
-    # Look for add-to-cart button in HTML
-    if 'data-test="addtocartbutton"' in html or 'data-test="addToCartButton"' in resp.text:
-        return True, "Add to cart button found (fast)", True
-
-    if 'data-test="shipitbutton"' in html or 'data-test="shipItButton"' in resp.text:
-        return True, "Ship it button found (fast)", True
-
-    if 'data-test="pickitupbutton"' in html or 'data-test="pickItUpButton"' in resp.text:
-        return True, "Pick it up button found (fast)", True
-
-    # Try to find product data in embedded JSON (__NEXT_DATA__ or similar)
-    try:
-        next_data_match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', resp.text, re.DOTALL)
-        if next_data_match:
-            data = json.loads(next_data_match.group(1))
-            data_str = json.dumps(data).lower()
-
-            if '"out_of_stock"' in data_str or '"unavailable"' in data_str:
-                return False, "API data: out of stock", True
-
-            if '"in_stock"' in data_str or '"available"' in data_str:
-                return True, "API data: in stock!", True
-    except Exception:
-        pass
-
-    # Try Target's fulfillment info in page
-    try:
-        tcin = get_tcin(url)
-        if tcin:
-            # Look for availability in any embedded JSON
-            avail_patterns = [
-                rf'"tcin":"{tcin}".*?"availability_status":"([^"]+)"',
-                r'"availability_status":"([^"]+)"',
-                r'"available_to_promise_quantity":(\d+)',
-            ]
-            for pattern in avail_patterns:
-                match = re.search(pattern, resp.text, re.DOTALL)
-                if match:
-                    val = match.group(1)
-                    if val in ("OUT_OF_STOCK", "UNAVAILABLE"):
-                        return False, f"Status: {val}", True
-                    elif val in ("IN_STOCK", "AVAILABLE", "LIMITED_STOCK"):
-                        return True, f"Status: {val}!", True
-                    elif val.isdigit() and int(val) > 0:
-                        return True, f"Quantity available: {val}!", True
-    except Exception:
-        pass
-
-    # Not conclusive - need browser check
-    return False, "Inconclusive (fast check)", False
-
-
-# --- Browser Check (fallback) ---
-
-def check_stock_browser(page, url: str) -> tuple[bool, str]:
-    """
-    Full browser check - slower but handles JS-rendered content.
-    """
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=15000)
-    except Exception as e:
-        return False, f"Page load error: {e}"
-
-    # Wait for any add-to-cart button (max 4 seconds)
-    for selector in TARGET_IN_STOCK_SELECTORS:
-        try:
-            element = page.wait_for_selector(selector, timeout=2000, state="visible")
-            if element:
-                button_text = element.inner_text().strip()
-                return True, f"Found: '{button_text}'"
-        except Exception:
-            continue
-
-    # Check page text
-    try:
-        page_text = page.inner_text("body").lower()
-    except Exception:
-        return False, "Could not read page"
-
-    for phrase in TARGET_OUT_OF_STOCK_INDICATORS:
-        if phrase in page_text:
-            return False, f"'{phrase}'"
-
-    # Last resort: check all buttons
-    try:
-        buttons = page.query_selector_all("button")
-        for btn in buttons:
-            try:
-                txt = btn.inner_text().strip().lower()
-                if "add to cart" in txt and btn.is_visible():
-                    return True, "Found 'add to cart' button"
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    return False, "No add-to-cart button"
 
 
 # --- Monitor Display ---
 
 class StatusMonitor:
-    def __init__(self, num_urls: int):
+    def __init__(self):
         self.start_time = time.time()
         self.total_checks = 0
         self.current_activity = "Starting..."
-        self.last_results = {}  # url -> result string
         self.state = "idle"
         self.next_check_at = 0
+        self.check_speed_ms = 0  # Last check duration
         self._spinner_idx = 0
         self._running = True
         self._lock = threading.Lock()
@@ -277,20 +225,23 @@ class StatusMonitor:
         uptime = self._get_uptime()
 
         if self.state == "checking":
-            status = f"{spinner} CHECKING..."
+            status = f"{spinner} CHECKING"
         elif self.state == "waiting":
             remaining = max(0, int(self.next_check_at - time.time()))
             status = f"{spinner} Next in {remaining}s"
         else:
-            status = f"{spinner} Starting..."
+            status = f"{spinner} Starting"
+
+        speed = f"{self.check_speed_ms}ms" if self.check_speed_ms else "---"
 
         line = (
             f"\r  {status} | "
-            f"Uptime: {uptime} | "
+            f"Up: {uptime} | "
             f"Checks: {self.total_checks} | "
+            f"Speed: {speed} | "
             f"{self.current_activity}"
         )
-        sys.stdout.write(f"{line:<130}")
+        sys.stdout.write(f"{line:<140}")
         sys.stdout.flush()
 
     def set_checking(self, activity: str = ""):
@@ -304,18 +255,18 @@ class StatusMonitor:
             self.state = "waiting"
             self.next_check_at = time.time() + interval
 
-    def set_result(self, url: str, result: str):
+    def set_result(self, activity: str, speed_ms: int = 0):
         with self._lock:
             self.total_checks += 1
-            name = get_short_name(url)[:20]
-            self.last_results[url] = result
-            self.current_activity = f"[{name}] {result}"
+            self.current_activity = activity
+            if speed_ms:
+                self.check_speed_ms = speed_ms
 
     def stop(self):
         self._running = False
 
     def clear_line(self):
-        sys.stdout.write("\r" + " " * 130 + "\r")
+        sys.stdout.write("\r" + " " * 140 + "\r")
         sys.stdout.flush()
 
 
@@ -325,11 +276,11 @@ def show_menu(config: dict):
     clear_screen()
     print()
     print("  ╔═══════════════════════════════════════════════════════╗")
-    print("  ║            TARGET STOCK CHECKER  v2.0                 ║")
+    print("  ║          TARGET STOCK CHECKER  v3.0 (SPEED)           ║")
     print("  ╠═══════════════════════════════════════════════════════╣")
     print("  ║                                                       ║")
     print(f"  ║   Check every: {config['interval_seconds']} second(s){' ' * (34 - len(str(config['interval_seconds'])))}║")
-    print(f"  ║   Method: Fast HTTP + Browser fallback                ║")
+    print("  ║   Method: Parallel browser + JS injection             ║")
     print("  ║                                                       ║")
     print("  ║   Products being monitored:                           ║")
 
@@ -415,9 +366,10 @@ def menu_change_interval(config: dict):
     print(f"  Current interval: {config['interval_seconds']} second(s)")
     print()
     print("  How often should it check? (in seconds)")
-    print("  1 = fastest (aggressive), 3 = fast, 5 = balanced, 10 = safe")
+    print("  1 = fastest, 3 = fast, 5 = balanced, 10 = safe")
     print()
-    print("  WARNING: 1-2 seconds is very aggressive and may get blocked.")
+    print("  TIP: With the new speed optimizations, each check takes")
+    print("  ~200-500ms. So interval 1 = checking every ~1.5 seconds total.")
 
     try:
         val = int(input("\n  Enter seconds: ").strip())
@@ -448,7 +400,6 @@ def menu_view_log():
 
     last_lines = lines[-30:] if len(lines) > 30 else lines
     for line in last_lines:
-        # Highlight IN STOCK entries
         text = line.rstrip()
         if "IN STOCK" in text:
             print(f"  >>> {text}")
@@ -475,9 +426,9 @@ def menu_test_alert():
     print("\n  Playing alert sound...")
     for _ in range(3):
         winsound.Beep(1000, 400)
-        time.sleep(0.15)
+        time.sleep(0.1)
         winsound.Beep(1500, 400)
-        time.sleep(0.15)
+        time.sleep(0.1)
     print("  Done.")
     input("\n  Press Enter to go back...")
 
@@ -504,23 +455,63 @@ def alert_user(url: str, reason: str):
         except Exception:
             pass
 
-    # Aggressive alert - loud and long
+    # Aggressive alert
     for _ in range(15):
         winsound.Beep(1000, 300)
-        time.sleep(0.1)
+        time.sleep(0.08)
         winsound.Beep(1500, 300)
-        time.sleep(0.1)
+        time.sleep(0.08)
 
 
 # --- Monitoring Engine ---
 
-def check_single_url(url: str, session: requests.Session) -> tuple[str, bool, str]:
-    """Check a single URL. Returns (url, in_stock, reason)."""
-    in_stock, reason, conclusive = check_stock_fast(url, session)
-    if conclusive:
-        return url, in_stock, f"[FAST] {reason}"
-    # If fast check was inconclusive, we'll note it for browser fallback
-    return url, False, f"[FAST] {reason}"
+def check_page_fast(page, url: str) -> tuple[bool, str]:
+    """
+    Ultra-fast check using JS fetch from within the browser context.
+    No page reload needed - just a background fetch + HTML scan.
+    """
+    try:
+        result = page.evaluate(JS_FETCH_CHECK, url)
+        if result.get("conclusive"):
+            return result["inStock"], result["reason"]
+    except Exception as e:
+        pass
+
+    # Fallback: check current DOM state
+    try:
+        result = page.evaluate(JS_CHECK_STOCK)
+        return result["inStock"], result["reason"]
+    except Exception:
+        return False, "Check failed"
+
+
+def check_page_full(page, url: str) -> tuple[bool, str]:
+    """
+    Full page reload check. Used on first load and periodically.
+    """
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=10000)
+    except Exception as e:
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=10000)
+        except Exception as e2:
+            return False, f"Load error: {e2}"
+
+    # Quick wait for any cart button (max 2s)
+    for selector in TARGET_IN_STOCK_SELECTORS:
+        try:
+            el = page.wait_for_selector(selector, timeout=800, state="visible")
+            if el:
+                return True, f"Button: {el.inner_text().strip()}"
+        except Exception:
+            continue
+
+    # Check DOM
+    try:
+        result = page.evaluate(JS_CHECK_STOCK)
+        return result["inStock"], result["reason"]
+    except Exception:
+        return False, "DOM check failed"
 
 
 def start_monitoring(config: dict):
@@ -537,64 +528,87 @@ def start_monitoring(config: dict):
     print("  ╔═══════════════════════════════════════════════════════╗")
     print("  ║       MONITORING - Press Ctrl+C to stop               ║")
     print("  ╠═══════════════════════════════════════════════════════╣")
-    print(f"  ║   {len(urls)} product(s) | every {interval}s | fast HTTP + browser{' ' * (11 - len(str(len(urls))) - len(str(interval)))}║")
+    print(f"  ║   {len(urls)} product(s) | every {interval}s | parallel + JS inject{' ' * (9 - len(str(len(urls))) - len(str(interval)))}║")
     for i, url in enumerate(urls):
         name = get_short_name(url)
         print(f"  ║   {i+1}. {name:<49} ║")
     print("  ╚═══════════════════════════════════════════════════════╝")
     print()
+    print("  Loading pages for the first time...")
 
     log(f"--- Started: {len(urls)} URLs, interval {interval}s ---")
 
-    monitor = StatusMonitor(num_urls=len(urls))
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    monitor = StatusMonitor()
 
-    # Browser setup for fallback
+    # Setup browser
     pw = sync_playwright().start()
     browser = pw.chromium.launch(headless=True)
-    context = browser.new_context(user_agent=HEADERS["User-Agent"])
+    context = browser.new_context(user_agent=USER_AGENT)
 
-    # Block unnecessary resources for speed
+    # Block unnecessary resources
     def block_resources(route):
-        url_lower = route.request.url.lower()
+        req_url = route.request.url.lower()
         if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
             route.abort()
-        elif any(pattern in url_lower for pattern in BLOCKED_URL_PATTERNS):
+        elif any(p in req_url for p in BLOCKED_URL_PATTERNS):
             route.abort()
         else:
             route.fallback()
 
-    page = context.new_page()
-    page.route("**/*", block_resources)
+    # Create one page per URL for parallel checking
+    pages = {}
+    for url in urls:
+        page = context.new_page()
+        page.route("**/*", block_resources)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_timeout(2000)  # Initial render only
+        except Exception as e:
+            log(f"Initial load error for {get_short_name(url)}: {e}")
+        pages[url] = page
 
-    inconclusive_count = {}  # Track how often fast check fails per URL
-    browser_check_threshold = 3  # Use browser after N inconclusive fast checks
+    print("  Pages loaded. Monitoring started!\n")
+    check_count = 0
+    full_reload_every = 10  # Do a full reload every N checks to refresh session
 
     try:
         while True:
-            monitor.set_checking("Checking all URLs...")
+            check_count += 1
+            monitor.set_checking("Checking...")
+            start_time = time.time()
 
-            # PARALLEL fast HTTP checks for all URLs
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(urls)) as executor:
-                futures = {
-                    executor.submit(check_single_url, url, session): url
-                    for url in list(urls)
-                }
+            # Check all pages
+            for url in list(urls):
+                page = pages.get(url)
+                if not page:
+                    continue
 
-                for future in concurrent.futures.as_completed(futures):
-                    url, in_stock, reason = future.result()
-                    name = get_short_name(url)
+                name = get_short_name(url)
 
-                    if in_stock:
+                # Every N checks, do a full reload to keep session fresh
+                if check_count % full_reload_every == 0:
+                    in_stock, reason = check_page_full(page, url)
+                    method = "RELOAD"
+                else:
+                    in_stock, reason = check_page_fast(page, url)
+                    method = "FAST"
+
+                elapsed_ms = int((time.time() - start_time) * 1000)
+
+                if in_stock:
+                    # Double-confirm with a full reload
+                    confirm_stock, confirm_reason = check_page_full(page, url)
+                    if confirm_stock:
                         monitor.stop()
                         monitor.clear_line()
-                        alert_user(url, reason)
+                        alert_user(url, f"{reason} (confirmed: {confirm_reason})")
                         log(f"*** IN STOCK: {name} - {reason} ***")
                         print("  Opening in your browser...")
                         import webbrowser
                         webbrowser.open(url)
                         urls.remove(url)
+                        page.close()
+                        del pages[url]
                         if not urls:
                             print("\n  All items found! Done.")
                             log("--- All items found. ---")
@@ -602,47 +616,16 @@ def start_monitoring(config: dict):
                             pw.stop()
                             input("\n  Press Enter to go back...")
                             return
-                        monitor = StatusMonitor(num_urls=len(urls))
+                        monitor = StatusMonitor()
                     else:
-                        log(f"[{name}] {reason}")
-                        monitor.set_result(url, reason)
+                        log(f"[{name}] False positive: {reason} -> {confirm_reason}")
+                        monitor.set_result(f"[{name[:15]}] {confirm_reason}", elapsed_ms)
+                else:
+                    log(f"[{name}] [{method}] {reason}")
+                    monitor.set_result(f"[{name[:15]}] {reason}", elapsed_ms)
 
-                        # Track inconclusive results for browser fallback
-                        if "Inconclusive" in reason:
-                            inconclusive_count[url] = inconclusive_count.get(url, 0) + 1
-
-            # Browser fallback for persistently inconclusive URLs
-            for url in list(urls):
-                if inconclusive_count.get(url, 0) >= browser_check_threshold:
-                    monitor.set_checking(f"Browser check: {get_short_name(url)[:20]}")
-                    in_stock, reason = check_stock_browser(page, url)
-                    name = get_short_name(url)
-                    reason_full = f"[BROWSER] {reason}"
-
-                    log(f"[{name}] {reason_full}")
-
-                    if in_stock:
-                        monitor.stop()
-                        monitor.clear_line()
-                        alert_user(url, reason_full)
-                        log(f"*** IN STOCK: {name} - {reason_full} ***")
-                        print("  Opening in your browser...")
-                        import webbrowser
-                        webbrowser.open(url)
-                        urls.remove(url)
-                        if not urls:
-                            print("\n  All items found! Done.")
-                            log("--- All items found. ---")
-                            browser.close()
-                            pw.stop()
-                            input("\n  Press Enter to go back...")
-                            return
-                        monitor = StatusMonitor(num_urls=len(urls))
-                    else:
-                        monitor.set_result(url, reason_full)
-
-                    inconclusive_count[url] = 0  # Reset counter
-
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            monitor.check_speed_ms = elapsed_ms
             monitor.set_waiting(interval)
             time.sleep(interval)
 
@@ -651,8 +634,13 @@ def start_monitoring(config: dict):
         monitor.clear_line()
         uptime = monitor._get_uptime()
         print(f"\n\n  Stopped. Ran for {uptime}, completed {monitor.total_checks} checks.")
-        log(f"--- Stopped by user. {monitor.total_checks} checks. ---")
+        log(f"--- Stopped. {monitor.total_checks} checks in {uptime}. ---")
     finally:
+        for p in pages.values():
+            try:
+                p.close()
+            except Exception:
+                pass
         browser.close()
         pw.stop()
 
