@@ -1,5 +1,7 @@
 # Target Stock Checker v3.1
 
+[![CI](https://github.com/Bortlesboat/stock-checker/actions/workflows/ci.yml/badge.svg)](https://github.com/Bortlesboat/stock-checker/actions/workflows/ci.yml)
+
 Monitors Target.com product pages and alerts you the instant an item comes in stock. Uses Playwright (headless Chromium) to render Target's React pages and detect "Add to Cart" buttons in the live DOM.
 
 ## Architecture
