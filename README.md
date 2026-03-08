@@ -113,7 +113,7 @@ The browser blocks these resource types to speed up page loads:
 ### Install
 
 ```bash
-cd C:\Users\andre\stock_checker
+cd stock_checker
 pip install -r requirements.txt
 python -m playwright install chromium
 ```
